@@ -58,6 +58,19 @@ def stock_data(t):
     except Exception:r['_loaded']=False
     return r
 
+def compact_amount(value):
+    """Display large amounts without changing their underlying numeric values."""
+    if value is None or pd.isna(value):
+        return 'N/A'
+    try:
+        value = float(value)
+    except (ValueError, TypeError):
+        return 'N/A'
+    for threshold, suffix in ((1e12, 'T'), (1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
+        if abs(value) >= threshold:
+            return f'{value / threshold:,.2f}{suffix}'
+    return f'{value:,.2f}'
+
 if st.button('Refresh data'):stock_data.clear();st.rerun()
 stocks,etfs=st.tabs(['📊 Stocks','🧺 ETFs (Coming Soon)'])
 with stocks:
@@ -69,11 +82,17 @@ with stocks:
         overview,financials,details,events,alerts=st.tabs(['Overview','Financials','Company detail','Milestones & earnings','Alerts'])
         with overview:
             columns=['Ticker','Company','Category','Price','1W %','1M %','YTD %','3Y %','Market Cap','Currency','As of']
-            st.dataframe(pd.DataFrame(rows).reindex(columns=columns),hide_index=True,use_container_width=True)
+            overview_df = pd.DataFrame(rows).reindex(columns=columns)
+            overview_df['Market Cap'] = overview_df['Market Cap'].map(compact_amount)
+            st.dataframe(overview_df,hide_index=True,use_container_width=True)
             st.caption('Price changes use adjusted daily closing prices (not intraday). YTD/3Y are price returns; three-year returns require sufficient history. Data may be delayed.')
         with financials:
             cols=['Ticker','P/E','Forward P/E','P/S','Revenue (TTM)','Revenue Growth YoY %','Free Cash Flow','Cash','Debt','52W High','52W Low']
-            st.dataframe(pd.DataFrame(rows).reindex(columns=cols),hide_index=True,use_container_width=True)
+            financials_df = pd.DataFrame(rows).reindex(columns=cols)
+            for amount_col in ['Revenue (TTM)', 'Free Cash Flow', 'Cash', 'Debt']:
+                financials_df[amount_col] = financials_df[amount_col].map(compact_amount)
+            financials_df = financials_df.fillna('N/A')
+            st.dataframe(financials_df,hide_index=True,use_container_width=True)
             st.caption('Fundamental figures come from Yahoo Finance and may be stale, missing or calculated on different reporting periods. N/A does not mean zero.')
         with details:
             selected=st.selectbox('Select company',st.session_state.tickers)

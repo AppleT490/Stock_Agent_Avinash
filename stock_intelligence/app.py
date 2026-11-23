@@ -1,11 +1,11 @@
 """Stock Agent Avinash: research dashboard, not a trading system."""
 import json
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from market_data import CATEGORIES, ETF_CATEGORIES, num, percent, price_history, history_return, recent_news, valid_ticker
+from market_data import CATEGORIES, ETF_CATEGORIES, num, percent, price_history, history_return, recent_news, valid_ticker, price_drop_in_hour
 
 HERE=Path(__file__).resolve().parent
 CONFIG=json.loads((HERE/'config.json').read_text())
@@ -27,7 +27,7 @@ with st.sidebar:
     rem=st.selectbox('Remove ticker',['—']+st.session_state.tickers)
     if st.button('Remove selected') and rem!='—':st.session_state.tickers.remove(rem);st.rerun()
     st.download_button('Export watchlist',pd.DataFrame({'Ticker':st.session_state.tickers}).to_csv(index=False),'watchlist.csv','text/csv')
-    st.info('Dashboard watchlist edits are session-only. Automated email monitoring uses config.json in GitHub. Update that file to change monitored tickers.')
+    st.info('Watchlist changes last only for this session. No email notifications or email credentials are used.')
 
 @st.cache_data(ttl=3600,show_spinner=False)
 def stock_data(t):
@@ -72,7 +72,140 @@ def compact_amount(value):
     return f'{value:,.2f}'
 
 if st.button('Refresh data'):stock_data.clear();st.rerun()
-stocks,etfs=st.tabs(['📊 Stocks','🧺 ETFs (Coming Soon)'])
+important,stocks,etfs=st.tabs(['🚨 Important','📊 Stocks','🧺 ETFs (Coming Soon)'])
+
+@st.cache_data(ttl=300, show_spinner=False)
+def scan_price_alert(ticker):
+    try:
+        return price_drop_in_hour(ticker)
+    except Exception:
+        return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def next_earnings_date(ticker):
+    try:
+        cal=yf.Ticker(ticker).calendar
+        if not isinstance(cal,dict):
+            return None
+        dates=cal.get('Earnings Date') or cal.get('EarningsDate')
+        if not dates:
+            return None
+        if not isinstance(dates,(list,tuple)):
+            dates=[dates]
+        for d in dates:
+            parsed=pd.to_datetime(d,errors='coerce')
+            if pd.notna(parsed):
+                day=parsed.date()
+                if day>=date.today():
+                    return day
+    except Exception:
+        pass
+    return None
+
+# News classifications are keyword-based leads for review, NOT verified events or price predictions.
+NEWS_RULES = [
+    ('Negative', 'High', ('fraud', 'scam', 'accounting irregularit', 'sec investigation', 'criminal investigation', 'bankrupt', 'chapter 11', 'restatement', 'class action', 'data breach', 'cyberattack', 'indict', 'subpoena', 'sanction', 'contract cancell', 'project cancell', 'regulatory rejection')),
+    ('Financial', 'High', ('share offering', 'public offering', 'stock offering', 'dilution', 'convertible notes', 'going concern', 'liquidity crisis', 'guidance cut', 'cuts guidance', 'revenue miss', 'earnings miss', 'debt default', 'capital raise')),
+    ('Positive', 'High', ('major contract', 'multibillion', 'billion-dollar deal', 'regulatory approval', 'fda approval', 'wins contract', 'signs contract', 'new partnership', 'strategic partnership', 'project approval', 'raises guidance')),
+    ('Financial', 'Medium', ('earnings', 'revenue', 'cash flow', 'debt', 'financing', 'acquisition', 'merger', 'guidance', 'dividend', 'buyback', 'quarterly results')),
+    ('Negative', 'Medium', ('lawsuit', 'investigation', 'probe', 'recall', 'delay', 'downgrade', 'layoff', 'regulatory concern')),
+    ('Positive', 'Medium', ('contract', 'partnership', 'expansion', 'new project', 'launch', 'breakthrough', 'approval', 'upgrade')),
+]
+
+def classify_headline(title):
+    text = title.lower()
+    for category, priority, terms in NEWS_RULES:
+        if any(term in text for term in terms):
+            return category, priority
+    return 'Other', 'Review'
+
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_company_news(ticker):
+    return recent_news(ticker, limit=12)
+
+with important:
+    st.subheader('🚨 Important — Stock Intelligence Monitor')
+    st.caption('Manual, on-demand scan. No email, account login, passwords, or background monitoring. Free news feeds may be incomplete or delayed.')
+    st.write('Scan the full watchlist for potentially significant headlines, price drops, and upcoming earnings — even if a stock price has not moved.')
+    c1,c2,c3=st.columns([2,1,1])
+    with c1:
+        scan_tickers=st.multiselect('Stocks to scan', st.session_state.tickers, default=st.session_state.tickers, key='important_scan')
+    with c2:
+        category_filter=st.selectbox('News category', ['All','Positive','Negative','Financial','Other'])
+    with c3:
+        impact_filter=st.selectbox('Priority', ['All','High','Medium','Review'])
+    run_scan=st.button('🔎 Refresh Important Updates',type='primary')
+    if run_scan:
+        if not scan_tickers:
+            st.warning('Select at least one stock.')
+        else:
+            findings=[]; errors=[]
+            progress=st.progress(0, text='Checking stock updates...')
+            for i,ticker in enumerate(scan_tickers):
+                rule=CONFIG.get('overrides',{}).get(ticker,{})
+                try:
+                    movement=scan_price_alert(ticker)
+                    threshold=float(rule.get('drop_percent',CONFIG.get('default_drop_percent',5)))
+                    if movement and movement['change_pct']<=-threshold:
+                        findings.append({'Ticker':ticker,'Category':'Price drop','Priority':'High',
+                            'Headline':f"{movement['change_pct']:.2f}% over approximately 1 hour (threshold {threshold:g}%)",
+                            'Published':movement['as_of'],'Source':'Intraday price data','URL':'',
+                            'Notes':'Price movement only; no verified cause identified'})
+                except Exception: errors.append(ticker+' price')
+                try:
+                    earnings=next_earnings_date(ticker)
+                    days=int(rule.get('earnings_reminder_days',CONFIG.get('earnings_reminder_days',7)))
+                    if earnings is not None and 0<=(earnings-date.today()).days<=days:
+                        findings.append({'Ticker':ticker,'Category':'Earnings','Priority':'Medium',
+                            'Headline':f"Provider-listed earnings date: {earnings.isoformat()}",
+                            'Published':date.today().isoformat(),'Source':'Yahoo Finance calendar','URL':'',
+                            'Notes':'Estimated date; verify with company investor relations'})
+                except Exception: errors.append(ticker+' earnings')
+                try:
+                    for article in scan_company_news(ticker):
+                        category,priority=classify_headline(article['title'])
+                        findings.append({'Ticker':ticker,'Category':category,'Priority':priority,
+                            'Headline':article['title'],'Published':article.get('published',''),
+                            'Source':'News link','URL':article['url'],
+                            'Notes':'Headline keyword match only; check source and publication date'})
+                except Exception: errors.append(ticker+' news')
+                progress.progress((i+1)/len(scan_tickers),text=f'Checked {i+1}/{len(scan_tickers)} stocks')
+            progress.empty()
+            # Deduplicate provider-repeated stories while retaining a ticker association.
+            unique={}
+            for item in findings:
+                key=(item['Ticker'],item['URL'] or item['Headline'])
+                unique[key]=item
+            st.session_state.important_findings=list(unique.values())
+            st.session_state.important_errors=errors
+            st.session_state.important_checked=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+            st.session_state.important_scanned=len(scan_tickers)
+    if 'important_checked' in st.session_state:
+        st.caption(f"Last completed check: {st.session_state.important_checked} · {st.session_state.important_scanned} stocks requested")
+        findings=st.session_state.get('important_findings',[])
+        selected=[f for f in findings if (category_filter=='All' or f['Category']==category_filter) and
+                  (impact_filter=='All' or f['Priority']==impact_filter)]
+        priority_order={'High':0,'Medium':1,'Review':2}
+        selected.sort(key=lambda f:(priority_order.get(f['Priority'],3),f['Ticker']))
+        high=sum(f['Priority']=='High' for f in findings)
+        st.metric('High-priority items to review',high)
+        if selected:
+            for item in selected:
+                with st.container(border=True):
+                    st.markdown(f"**{item['Ticker']}** · {item['Category']} · **{item['Priority']} priority**")
+                    if item['URL']:
+                        st.markdown(f"[{item['Headline']}]({item['URL']})")
+                    else:
+                        st.write(item['Headline'])
+                    st.caption(f"{item['Published'] or 'Publication time unavailable'} · {item['Notes']}")
+        else:
+            st.info('No items match these filters. Missing feeds or delayed prices do not mean there were no significant developments.')
+        if st.session_state.get('important_errors'):
+            st.warning('Some data checks failed or were unavailable: '+', '.join(st.session_state.important_errors[:8]))
+    else:
+        st.info('Click “Refresh Important Updates” to scan your watchlist. No scan has been performed in this session.')
+    st.caption('High/Medium are keyword-based REVIEW priorities, not verified impact or investment recommendations. Allegations are not established facts. Open linked sources before drawing conclusions. Revenue slowdown detection requires validated financial comparisons and is not active yet.')
+
 with stocks:
     if st.session_state.tickers:
         with st.spinner('Loading stock research data...'):
@@ -111,20 +244,10 @@ with stocks:
                 for item in news:st.markdown(f"- [{item['title']}]({item['url']})" + (f" — {item['published']}" if item['published'] else ''))
             else:st.write('No recent linked news available from this provider. No verified catalyst identified.')
         with events:
-            st.info('Earnings reminders are supported by the scheduled alert script when a confirmed future earnings date is available from the data provider. A comprehensive verified milestone calendar is not yet implemented.')
+            st.info('Earnings reminders can be checked manually in the Important tab when the data provider supplies a future date. A comprehensive verified milestone calendar is not yet implemented.')
         with alerts:
-            st.write('**Automatic email monitoring:** rolling 60-minute price declines, default 5%, including available extended-hours bars.')
-            st.write('**Configured stocks:** '+', '.join(CONFIG['tickers']))
-            st.write('**OKLO:** 5% drop threshold, 7-day earnings reminder, revenue slowdown and major-news monitoring configured.')
-            st.caption('Email requires GitHub Actions and private email secrets. Revenue and major-news alerts are experimental; no automatic alerts for them until reliable change detection is implemented.')
-            statefile=HERE/'alert_state.json'
-            if statefile.exists():
-                try:
-                    state=json.loads(statefile.read_text()); history=state.get('history',[])
-                    if history:st.dataframe(pd.DataFrame(history[-100:][::-1]),hide_index=True,use_container_width=True)
-                    else:st.info('No alerts recorded yet.')
-                except Exception:st.info('Alert history currently unavailable.')
-            else:st.info('No alert history yet. Scheduled monitoring has not recorded an event.')
+            st.info('Email notifications are disabled. Use the 🚨 Important tab to manually check price-drop alerts, upcoming earnings and recent headlines.')
+            st.caption('The Important tab performs on-demand checks only; no background monitoring or persistent alert history is enabled.')
     else:st.info('Add a stock in the sidebar.')
 with etfs:
     st.subheader('ETF Intelligence — Coming Soon')

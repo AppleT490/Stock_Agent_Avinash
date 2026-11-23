@@ -1,0 +1,14 @@
+{
+  "tickers": ["NVDA", "NBIS", "AMD", "ORCL", "CRWV", "OKLO"],
+  "default_drop_percent": 5,
+  "lookback_minutes": 60,
+  "cooldown_hours": 6,
+  "earnings_reminder_days": 7,
+  "enable_earnings_reminders": true,
+  "enable_news_in_email": true,
+  "enable_revenue_slowdown": true,
+  "enable_major_news": true,
+  "overrides": {
+    "OKLO": {"drop_percent": 5, "earnings_reminder_days": 7, "revenue_slowdown": true, "major_news": true}
+  }
+}
